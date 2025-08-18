@@ -54,6 +54,7 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
   const [includeMic, setIncludeMic] = useState<boolean>(true);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const cameraPreviewRef = useRef<HTMLVideoElement>(null);
+  const cameraOverlayRef = useRef<HTMLVideoElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState<boolean>(false);
   const bubbleSizeRatio = 0.2;
@@ -65,13 +66,15 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
   useEffect(() => {
     if (includeCamera) {
       navigator.mediaDevices
-        .getUserMedia({ video: true })
+        .getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 360 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+        })
         .then((stream) => {
           setCameraStream(stream);
-          if (cameraPreviewRef.current) {
-            cameraPreviewRef.current.srcObject = stream;
-            void cameraPreviewRef.current.play();
-          }
         })
         .catch((err) => console.error(err));
     } else {
@@ -85,6 +88,19 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [includeCamera]);
 
+  useEffect(() => {
+    if (cameraStream) {
+      if (cameraPreviewRef.current) {
+        cameraPreviewRef.current.srcObject = cameraStream;
+        void cameraPreviewRef.current.play();
+      }
+      if (cameraOverlayRef.current) {
+        cameraOverlayRef.current.srcObject = cameraStream;
+        void cameraOverlayRef.current.play();
+      }
+    }
+  }, [cameraStream, step]);
+
   const handleMouseDown = () => {
     setDragging(true);
   };
@@ -93,9 +109,13 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
     setDragging(false);
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement, MouseEvent>) => {
-    if (!dragging || !previewRef.current) return;
-    const rect = previewRef.current.getBoundingClientRect();
+  const handleMouseMove = (
+    e: React.MouseEvent<HTMLDivElement | HTMLVideoElement, MouseEvent>
+  ) => {
+    if (!dragging) return;
+    const rect = previewRef.current
+      ? previewRef.current.getBoundingClientRect()
+      : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
     const size = rect.width * bubbleSizeRatio;
     const x = (e.clientX - rect.left - size / 2) / rect.width;
     const y = (e.clientY - rect.top - size / 2) / rect.height;
@@ -146,6 +166,7 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
     await screenVideo.play();
 
     const camVideo = document.createElement("video");
+    camVideo.playsInline = true;
     if (includeCamera && cameraStream) {
       camVideo.srcObject = cameraStream;
       await camVideo.play();
@@ -388,6 +409,23 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
 
   return (
     <div>
+      {includeCamera && step === "in" ? (
+        <video
+          ref={cameraOverlayRef}
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
+          onMouseMove={handleMouseMove}
+          muted
+          playsInline
+          className="fixed z-50 cursor-move rounded-full border-2 border-white"
+          style={{
+            width: `${bubbleSizeRatio * 100}vw`,
+            height: `${bubbleSizeRatio * 100}vw`,
+            left: `${bubblePos.x * 100}vw`,
+            top: `${bubblePos.y * 100}vh`,
+          }}
+        />
+      ) : null}
       {step === "pre" ? (
         <div className="w-full">
           <div className="mb-2 space-y-2">
@@ -421,6 +459,7 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
                 ref={cameraPreviewRef}
                 onMouseDown={handleMouseDown}
                 muted
+                playsInline
                 className="absolute cursor-move rounded-full border-2 border-white"
                 style={{
                   width: `${bubbleSizeRatio * 100}%`,
