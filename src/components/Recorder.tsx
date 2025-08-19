@@ -50,12 +50,97 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
   const [, setPaywallOpen] = useAtom(paywallAtom);
   const videoRef = useRef<null | HTMLVideoElement>(null);
   const posthog = usePostHog();
+  const [includeCamera, setIncludeCamera] = useState<boolean>(false);
+  const [includeMic, setIncludeMic] = useState<boolean>(true);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const cameraPreviewRef = useRef<HTMLVideoElement>(null);
+  const cameraOverlayRef = useRef<HTMLVideoElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState<boolean>(false);
+  const bubbleSizeRatio = 0.2;
+  const [bubblePos, setBubblePos] = useState<{ x: number; y: number }>({
+    x: 0.8 - bubbleSizeRatio,
+    y: 0.8 - bubbleSizeRatio,
+  });
+
+  useEffect(() => {
+    if (includeCamera) {
+      navigator.mediaDevices
+        .getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 360 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+        })
+        .then((stream) => {
+          setCameraStream(stream);
+        })
+        .catch((err) => console.error(err));
+    } else {
+      cameraStream?.getTracks().forEach((t) => t.stop());
+      setCameraStream(null);
+    }
+
+    return () => {
+      cameraStream?.getTracks().forEach((t) => t.stop());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeCamera]);
+
+  useEffect(() => {
+    if (cameraStream) {
+      if (cameraPreviewRef.current) {
+        cameraPreviewRef.current.srcObject = cameraStream;
+        void cameraPreviewRef.current.play();
+      }
+      if (cameraOverlayRef.current) {
+        cameraOverlayRef.current.srcObject = cameraStream;
+        void cameraOverlayRef.current.play();
+      }
+    }
+  }, [cameraStream, step]);
+
+  const handleMouseDown = () => {
+    setDragging(true);
+  };
+
+  const handleMouseUp = () => {
+    setDragging(false);
+  };
+
+  const handleMouseMove = (
+    e: React.MouseEvent<HTMLDivElement | HTMLVideoElement, MouseEvent>
+  ) => {
+    if (!dragging) return;
+    const rect = previewRef.current
+      ? previewRef.current.getBoundingClientRect()
+      : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    const size = rect.width * bubbleSizeRatio;
+    const x = (e.clientX - rect.left - size / 2) / rect.width;
+    const y = (e.clientY - rect.top - size / 2) / rect.height;
+    setBubblePos({
+      x: Math.min(1 - bubbleSizeRatio, Math.max(0, x)),
+      y: Math.min(1 - bubbleSizeRatio, Math.max(0, y)),
+    });
+  };
+
+  const getSupportedMimeType = () => {
+    const mimeCandidates = [
+      'video/webm;codecs="vp9,opus"',
+      'video/webm;codecs="vp8,opus"',
+      'video/webm',
+      'video/mp4',
+    ];
+    for (const mime of mimeCandidates) {
+      if (MediaRecorder.isTypeSupported(mime)) return mime;
+    }
+    return 'video/webm';
+  };
 
   const handleRecording = async () => {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
-        width: 1920,
-        height: 1080,
         frameRate: 30,
       },
       audio: {
@@ -65,37 +150,90 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
       },
     });
 
-    let micStream;
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: selectedDevice?.deviceId },
-      });
-    } catch (error) {
-      // Handle the case where microphone permissions are not granted
-      console.error("Failed to access microphone:", error);
+    let micStream: MediaStream | null = null;
+    if (includeMic) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: selectedDevice?.deviceId, echoCancellation: true },
+        });
+      } catch (error) {
+        console.error("Failed to access microphone:", error);
+      }
     }
 
-    const mediaStream = new MediaStream();
-    if (micStream) {
-      micStream
-        .getAudioTracks()
-        .forEach((track) => mediaStream.addTrack(track));
-    }
-    screenStream
-      .getVideoTracks()
-      .forEach((track) => mediaStream.addTrack(track));
+    const screenVideo = document.createElement("video");
+    screenVideo.srcObject = screenStream;
+    await screenVideo.play();
 
-    const firstVideoTrack = screenStream.getVideoTracks()[0];
+    const camVideo = document.createElement("video");
+    camVideo.playsInline = true;
+    if (includeCamera && cameraStream) {
+      camVideo.srcObject = cameraStream;
+      await camVideo.play();
+    }
+
+    const screenTrack = screenStream.getVideoTracks()[0];
+    if (!screenTrack) return;
+    const {
+      width = 1440,
+      height = 810,
+      frameRate = 30,
+    } = screenTrack.getSettings();
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+
+    const draw = () => {
+      ctx?.drawImage(screenVideo, 0, 0, width, height);
+      if (includeCamera && cameraStream) {
+        const size = width * bubbleSizeRatio;
+        const x = bubblePos.x * width;
+        const y = bubblePos.y * height;
+        ctx?.save();
+        ctx?.beginPath();
+        ctx?.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
+        ctx?.clip();
+        ctx?.drawImage(camVideo, x, y, size, size);
+        ctx?.restore();
+      }
+      requestAnimationFrame(draw);
+    };
+    draw();
+
+    const canvasStream = canvas.captureStream(frameRate);
+    const composedStream = new MediaStream();
+    canvasStream.getVideoTracks().forEach((t) => composedStream.addTrack(t));
+
+    const audioContext = new AudioContext();
+    const destination = audioContext.createMediaStreamDestination();
+
+    if (screenStream.getAudioTracks().length > 0) {
+      const systemSource = audioContext.createMediaStreamSource(screenStream);
+      const systemGain = audioContext.createGain();
+      systemGain.gain.value = includeMic ? 0.7 : 1.0;
+      systemSource.connect(systemGain).connect(destination);
+    }
+
+    if (micStream && micStream.getAudioTracks().length > 0) {
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      micSource.connect(destination);
+    }
+
+    destination.stream.getAudioTracks().forEach((t) => composedStream.addTrack(t));
+
+    const firstVideoTrack = canvasStream.getVideoTracks()[0];
     if (firstVideoTrack) {
       firstVideoTrack.addEventListener("ended", () => handleStop());
     }
 
-    setStream(mediaStream);
-    recorderRef.current = new RecordRTC(mediaStream, {
+    setStream(composedStream);
+    recorderRef.current = new RecordRTC(composedStream, {
       type: "video",
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore
-      mimeType: 'video/webm;codecs="vp9,opus"',
+      mimeType: getSupportedMimeType(),
     });
     recorderRef.current.startRecording();
 
@@ -271,71 +409,132 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
 
   return (
     <div>
+      {includeCamera && step === "in" ? (
+        <video
+          ref={cameraOverlayRef}
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
+          onMouseMove={handleMouseMove}
+          muted
+          playsInline
+          className="fixed z-50 cursor-move rounded-full border-2 border-white"
+          style={{
+            width: `${bubbleSizeRatio * 100}vw`,
+            height: `${bubbleSizeRatio * 100}vw`,
+            left: `${bubblePos.x * 100}vw`,
+            top: `${bubblePos.y * 100}vh`,
+          }}
+        />
+      ) : null}
       {step === "pre" ? (
         <div className="w-full">
-          <Listbox value={selectedDevice} onChange={setSelectedDevice}>
-            <div className="relative mt-1">
-              <Listbox.Button className="relative flex w-full cursor-default flex-row items-center justify-start rounded-lg bg-white py-2 pl-3 pr-10 text-left shadow-md focus:outline-none focus-visible:border-indigo-500 focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-opacity-75 focus-visible:ring-offset-2 sm:text-sm">
-                <MicrophoneIcon
-                  className="mr-2 h-5 w-5 text-gray-400"
-                  aria-hidden="true"
-                />
-                <span className="block truncate">
-                  {selectedDevice?.label ?? "No device selected"}
-                  {selectedDevice?.label === "" ? "Enabled" : null}
-                </span>
-                <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
-                  <ChevronUpDownIcon
-                    className="h-5 w-5 text-gray-400"
+          <div className="mb-2 space-y-2">
+            <label className="flex items-center">
+              <input
+                type="checkbox"
+                className="mr-2"
+                checked={includeCamera}
+                onChange={(e) => setIncludeCamera(e.target.checked)}
+              />
+              Include camera bubble
+            </label>
+            <label className="flex items-center">
+              <input
+                type="checkbox"
+                className="mr-2"
+                checked={includeMic}
+                onChange={(e) => setIncludeMic(e.target.checked)}
+              />
+              Mic
+            </label>
+          </div>
+          {includeCamera ? (
+            <div
+              ref={previewRef}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              className="relative mb-2 aspect-video w-full rounded-md bg-black"
+            >
+              <video
+                ref={cameraPreviewRef}
+                onMouseDown={handleMouseDown}
+                muted
+                playsInline
+                className="absolute cursor-move rounded-full border-2 border-white"
+                style={{
+                  width: `${bubbleSizeRatio * 100}%`,
+                  height: `${bubbleSizeRatio * 100}%`,
+                  left: `${bubblePos.x * 100}%`,
+                  top: `${bubblePos.y * 100}%`,
+                }}
+              />
+            </div>
+          ) : null}
+          <div className={includeMic ? "" : "pointer-events-none opacity-50"}>
+            <Listbox value={selectedDevice} onChange={setSelectedDevice}>
+              <div className="relative mt-1">
+                <Listbox.Button className="relative flex w-full cursor-default flex-row items-center justify-start rounded-lg bg-white py-2 pl-3 pr-10 text-left shadow-md focus:outline-none focus-visible:border-indigo-500 focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-opacity-75 focus-visible:ring-offset-2 sm:text-sm">
+                  <MicrophoneIcon
+                    className="mr-2 h-5 w-5 text-gray-400"
                     aria-hidden="true"
                   />
-                </span>
-              </Listbox.Button>
-              <Transition
-                as={Fragment}
-                enter="ease-out duration-300"
-                enterFrom="opacity-0"
-                enterTo="opacity-100"
-                leave="ease-in duration-200"
-                leaveFrom="opacity-100"
-                leaveTo="opacity-0"
-              >
-                <Listbox.Options className="absolute mt-1 max-h-60 w-full overflow-auto rounded-md bg-white py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm">
-                  {audioDevices.map((audioDevice, i) => (
-                    <Listbox.Option
-                      key={i}
-                      className={({ active }) =>
-                        `relative cursor-default select-none py-2 pl-10 pr-4 text-gray-900 ${
-                          active ? "bg-gray-200" : ""
-                        }`
-                      }
-                      value={audioDevice}
-                    >
-                      {({ selected }) => (
-                        <>
-                          <span
-                            className={`block truncate ${
-                              selected ? "font-medium" : "font-normal"
-                            }`}
-                          >
-                            {audioDevice.label}
-                          </span>
-                          {selected ? (
-                            <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-amber-600">
-                              <CheckIcon
-                                className="h-5 w-5"
-                                aria-hidden="true"
-                              />
+                  <span className="block truncate">
+                    {selectedDevice?.label ?? "No device selected"}
+                    {selectedDevice?.label === "" ? "Enabled" : null}
+                  </span>
+                  <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
+                    <ChevronUpDownIcon
+                      className="h-5 w-5 text-gray-400"
+                      aria-hidden="true"
+                    />
+                  </span>
+                </Listbox.Button>
+                <Transition
+                  as={Fragment}
+                  enter="ease-out duration-300"
+                  enterFrom="opacity-0"
+                  enterTo="opacity-100"
+                  leave="ease-in duration-200"
+                  leaveFrom="opacity-100"
+                  leaveTo="opacity-0"
+                >
+                  <Listbox.Options className="absolute mt-1 max-h-60 w-full overflow-auto rounded-md bg-white py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm">
+                    {audioDevices.map((audioDevice, i) => (
+                      <Listbox.Option
+                        key={i}
+                        className={({ active }) =>
+                          `relative cursor-default select-none py-2 pl-10 pr-4 text-gray-900 ${
+                            active ? "bg-gray-200" : ""
+                          }`
+                        }
+                        value={audioDevice}
+                      >
+                        {({ selected }) => (
+                          <>
+                            <span
+                              className={`block truncate ${
+                                selected ? "font-medium" : "font-normal"
+                              }`}
+                            >
+                              {audioDevice.label}
                             </span>
-                          ) : null}
-                        </>
-                      )}
-                    </Listbox.Option>
-                  ))}
-                </Listbox.Options>
-              </Transition>
-            </div>
-          </Listbox>
+                            {selected ? (
+                              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-amber-600">
+                                <CheckIcon
+                                  className="h-5 w-5"
+                                  aria-hidden="true"
+                                />
+                              </span>
+                            ) : null}
+                          </>
+                        )}
+                      </Listbox.Option>
+                    ))}
+                  </Listbox.Options>
+                </Transition>
+              </div>
+            </Listbox>
+          </div>
           <button
             type="button"
             className="mt-4 inline-flex w-full items-center justify-center rounded-md bg-indigo-500 px-4 py-2 text-sm font-semibold leading-6 text-white shadow transition duration-150 ease-in-out hover:bg-indigo-400 disabled:cursor-not-allowed"
