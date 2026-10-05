@@ -35,11 +35,27 @@ export default function VideoRecordModal() {
           leaveFrom="opacity-100"
           leaveTo="opacity-0"
         >
-          <div className="fixed inset-0 bg-black bg-opacity-25" />
+          <div
+            className={`fixed inset-0 transition-colors ${
+              step === "in"
+                ? "bg-transparent pointer-events-none"
+                : "bg-black bg-opacity-25"
+            }`}
+          />
         </Transition.Child>
 
-        <div className="fixed inset-0 overflow-y-auto">
-          <div className="flex min-h-full items-center justify-center p-4 text-center">
+        <div
+          className={`fixed inset-0 overflow-y-auto ${
+            step === "in" ? "pointer-events-none" : ""
+          }`}
+        >
+          <div
+            className={`flex min-h-full p-4 text-center transition-all ${
+              step === "in"
+                ? "items-end justify-center pb-8"
+                : "items-center justify-center"
+            }`}
+          >
             <Transition.Child
               as={Fragment}
               enter="ease-out duration-300"
@@ -49,7 +65,11 @@ export default function VideoRecordModal() {
               leaveFrom="opacity-100 scale-100"
               leaveTo="opacity-0 scale-95"
             >
-              <Dialog.Panel className="w-fit transform rounded-lg bg-white p-6 text-left align-middle shadow-xl transition-all">
+              <Dialog.Panel
+                className={`w-fit pointer-events-auto transform rounded-lg bg-white text-left align-middle shadow-xl transition-all ${
+                  step === "in" ? "p-3 shadow-2xl border border-gray-100" : "p-6"
+                }`}
+              >
                 <Recorder
                   closeModal={closeModal}
                   step={step}

@@ -1,8 +1,12 @@
-import React, { useState, useRef, Fragment, useEffect } from "react";
+import React, { useState, useRef, Fragment, useEffect, useCallback } from "react";
 import RecordRTC, { invokeSaveAsDialog } from "recordrtc";
-import { Listbox, Transition } from "@headlessui/react";
+import { Listbox, Transition, Switch } from "@headlessui/react";
 import { CheckIcon, ChevronUpDownIcon } from "@heroicons/react/20/solid";
-import { MicrophoneIcon, PauseIcon } from "@heroicons/react/24/outline";
+import {
+  MicrophoneIcon,
+  PauseIcon,
+  VideoCameraIcon,
+} from "@heroicons/react/24/outline";
 import { ResumeIcon, TrashIcon } from "@radix-ui/react-icons";
 import { StopIcon } from "@heroicons/react/24/solid";
 import StopTime from "~/components/StopTime";
@@ -17,8 +21,14 @@ import recordVideoModalOpen from "~/atoms/recordVideoModalOpen";
 import { usePostHog } from "posthog-js/react";
 import Tooltip from "~/components/Tooltip";
 import generateThumbnail from "~/utils/generateThumbnail";
-import * as EBML from "ts-ebml";
 import VideoPlayer from "~/components/VideoPlayer";
+import {
+  CanvasCompositor,
+  type BubbleCorner,
+  type BubbleSize,
+} from "~/sdk/compositor";
+import CameraBubbleOverlay from "~/sdk/CameraBubbleOverlay";
+import { makeSeekableWebm } from "~/sdk/webmUtils";
 
 interface Props {
   closeModal: () => void;
@@ -33,130 +43,214 @@ interface Props {
 }
 
 export default function Recorder({ closeModal, step, setStep }: Props) {
-  const [steam, setStream] = useState<null | MediaStream>(null);
   const [blob, setBlob] = useState<null | Blob>(null);
   const recorderRef = useRef<null | RecordRTC>(null);
+  const compositorRef = useRef<null | CanvasCompositor>(null);
+  const activeStreamsRef = useRef<MediaStream[]>([]);
   const [pause, setPause] = useState<boolean>(false);
+
+  // Audio and camera devices
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDevice, setSelectedDevice] = useState<MediaDeviceInfo | null>(
-    null
-  );
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioDevice, setSelectedAudioDevice] =
+    useState<MediaDeviceInfo | null>(null);
+  const [selectedCameraDevice, setSelectedCameraDevice] =
+    useState<MediaDeviceInfo | null>(null);
+  const [isCameraEnabled, setIsCameraEnabled] = useState<boolean>(true);
+
+  // Bubble settings
+  const [bubbleCorner, setBubbleCorner] = useState<BubbleCorner>("bottom-left");
+  const [bubbleSize, setBubbleSize] = useState<BubbleSize>("medium");
+  const [isMirrored, setIsMirrored] = useState<boolean>(true);
+  const [isCameraMuted, setIsCameraMuted] = useState<boolean>(false);
+  const [normalizedPosition, setNormalizedPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+
   const router = useRouter();
   const [, setRecordOpen] = useAtom(recordVideoModalOpen);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const apiUtils = api.useContext();
   const getSignedUrl = api.video.getUploadUrl.useMutation();
   const [duration, setDuration] = useState<number>(0);
+  const durationRef = useRef<number>(0);
   const [, setPaywallOpen] = useAtom(paywallAtom);
   const videoRef = useRef<null | HTMLVideoElement>(null);
   const posthog = usePostHog();
 
+  useEffect(() => {
+    durationRef.current = duration;
+  }, [duration]);
+
+  const cleanup = useCallback(() => {
+    if (compositorRef.current) {
+      compositorRef.current.stop();
+      compositorRef.current = null;
+    }
+
+    activeStreamsRef.current.forEach((stream) => {
+      stream.getTracks().forEach((track) => track.stop());
+    });
+    activeStreamsRef.current = [];
+
+    setCameraStream(null);
+  }, []);
+
   const handleRecording = async () => {
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: 1920,
-        height: 1080,
-        frameRate: 30,
-      },
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        sampleRate: 44100,
-      },
-    });
-
-    let micStream;
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: selectedDevice?.deviceId },
+      // 1. Screen capture
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          width: 1920,
+          height: 1080,
+          frameRate: 30,
+        },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          sampleRate: 44100,
+        },
       });
-    } catch (error) {
-      // Handle the case where microphone permissions are not granted
-      console.error("Failed to access microphone:", error);
-    }
 
-    const mediaStream = new MediaStream();
-    if (micStream) {
-      micStream
+      // 2. Microphone capture
+      let micStream: MediaStream | null = null;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: selectedAudioDevice?.deviceId
+            ? { deviceId: { exact: selectedAudioDevice.deviceId } }
+            : true,
+        });
+      } catch (error) {
+        console.error("Failed to access microphone:", error);
+      }
+
+      // 3. Camera capture if enabled
+      let camStream: MediaStream | null = null;
+      if (isCameraEnabled) {
+        try {
+          camStream = await navigator.mediaDevices.getUserMedia({
+            video: selectedCameraDevice?.deviceId
+              ? {
+                  deviceId: { exact: selectedCameraDevice.deviceId },
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                }
+              : { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+          setCameraStream(camStream);
+        } catch (error) {
+          console.error("Failed to access camera:", error);
+        }
+      }
+
+      // 4. Composite streams if camera is active
+      let recordingStream: MediaStream;
+      if (camStream) {
+        const compositor = new CanvasCompositor({
+          screenStream,
+          cameraStream: camStream,
+          corner: bubbleCorner,
+          normalizedPosition: normalizedPosition ?? undefined,
+          size: bubbleSize,
+          mirrored: isMirrored,
+          cameraMuted: isCameraMuted,
+          frameRate: 30,
+        });
+        compositorRef.current = compositor;
+        const compositedVideo = await compositor.start();
+
+        recordingStream = new MediaStream();
+        compositedVideo
+          .getVideoTracks()
+          .forEach((track) => recordingStream.addTrack(track));
+      } else {
+        recordingStream = new MediaStream();
+        screenStream
+          .getVideoTracks()
+          .forEach((track) => recordingStream.addTrack(track));
+      }
+
+      // Add audio tracks (mic + screen audio)
+      if (micStream) {
+        micStream
+          .getAudioTracks()
+          .forEach((track) => recordingStream.addTrack(track));
+      }
+      screenStream
         .getAudioTracks()
-        .forEach((track) => mediaStream.addTrack(track));
+        .forEach((track) => recordingStream.addTrack(track));
+
+      const firstVideoTrack = screenStream.getVideoTracks()[0];
+      if (firstVideoTrack) {
+        firstVideoTrack.addEventListener("ended", () => handleStop());
+      }
+
+      const streamsToTrack = [screenStream];
+      if (micStream) streamsToTrack.push(micStream);
+      if (camStream) streamsToTrack.push(camStream);
+      activeStreamsRef.current = streamsToTrack;
+
+      recorderRef.current = new RecordRTC(recordingStream, {
+        type: "video",
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        mimeType: 'video/webm;codecs="vp9,opus"',
+      });
+      recorderRef.current.startRecording();
+
+      setStep("in");
+      posthog?.capture("recorder: start video recording", {
+        withCamera: !!camStream,
+      });
+    } catch (err) {
+      console.error("Failed to start recording:", err);
+      cleanup();
     }
-    screenStream
-      .getVideoTracks()
-      .forEach((track) => mediaStream.addTrack(track));
-
-    const firstVideoTrack = screenStream.getVideoTracks()[0];
-    if (firstVideoTrack) {
-      firstVideoTrack.addEventListener("ended", () => handleStop());
-    }
-
-    setStream(mediaStream);
-    recorderRef.current = new RecordRTC(mediaStream, {
-      type: "video",
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore
-      mimeType: 'video/webm;codecs="vp9,opus"',
-    });
-    recorderRef.current.startRecording();
-
-    setStep("in");
-
-    posthog?.capture("recorder: start video recording");
   };
-
-  function getSeekableBlob(inputBlob: Blob, callback: (blob: Blob) => void) {
-    const reader = new EBML.Reader();
-    const decoder = new EBML.Decoder();
-    const tools = EBML.tools;
-
-    const fileReader = new FileReader();
-    fileReader.onload = function () {
-      if (!this.result || typeof this.result === "string") return;
-      const ebmlElms = decoder.decode(this.result);
-      ebmlElms.forEach(function (element) {
-        reader.read(element);
-      });
-      reader.stop();
-
-      const refinedMetadataBuf = tools.makeMetadataSeekable(
-        reader.metadatas,
-        duration * 1000,
-        reader.cues
-      );
-
-      const body = this.result.slice(reader.metadataSize);
-      const newBlob = new Blob([refinedMetadataBuf, body], {
-        type: "video/webm",
-      });
-
-      callback(newBlob);
-    };
-    fileReader.readAsArrayBuffer(inputBlob);
-  }
 
   const handleStop = () => {
     if (recorderRef.current === null) return;
     recorderRef.current.stopRecording(() => {
-      if (recorderRef.current) {
-        getSeekableBlob(recorderRef.current.getBlob(), function (fixedBlob) {
-          setBlob(fixedBlob);
-        });
-        steam?.getTracks().map((track) => track.stop());
-      }
+      void (async () => {
+        try {
+          const rawBlob = recorderRef.current?.getBlob();
+          if (rawBlob) {
+            const fixedBlob = await makeSeekableWebm(
+              rawBlob,
+              durationRef.current
+            );
+            setBlob(fixedBlob);
+          }
+        } catch (err) {
+          console.error("Error finalizing seekable WebM:", err);
+        } finally {
+          cleanup();
+          setStep("post");
+          posthog?.capture("recorder: video recording finished");
+        }
+      })();
     });
-
-    setStep("post");
-
-    posthog?.capture("recorder: video recording finished");
   };
 
   const handleDelete = () => {
-    if (recorderRef.current === null) return;
-    setBlob(null);
-    recorderRef.current.stopRecording(() => {
-      steam?.getTracks().map((track) => track.stop());
-    });
+    if (recorderRef.current) {
+      try {
+        recorderRef.current.stopRecording(() => {
+          cleanup();
+        });
+      } catch {
+        cleanup();
+      }
+    } else {
+      cleanup();
+    }
 
+    setBlob(null);
+    setDuration(0);
+    durationRef.current = 0;
     closeModal();
     setStep("pre");
 
@@ -165,7 +259,6 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
 
   const handlePause = () => {
     if (recorderRef.current) {
-      console.log(recorderRef.current?.state);
       if (pause) {
         recorderRef.current?.resumeRecording();
       } else {
@@ -177,25 +270,27 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
   };
 
   useEffect(() => {
-    async function getAudioDevices() {
+    async function getDevices() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: false },
-        });
-        stream.getTracks().forEach((track) => track.stop()); // release the stream
-
         const devices = await navigator.mediaDevices.enumerateDevices();
-        const audioDevices = devices.filter(
+        const audios = devices.filter(
           (device) => device.kind === "audioinput"
         );
-        setAudioDevices(audioDevices);
-        if (audioDevices[0]) setSelectedDevice(audioDevices[0]);
+        const videos = devices.filter(
+          (device) => device.kind === "videoinput"
+        );
+
+        setAudioDevices(audios);
+        setVideoDevices(videos);
+
+        if (audios[0]) setSelectedAudioDevice(audios[0]);
+        if (videos[0]) setSelectedCameraDevice(videos[0]);
       } catch (error) {
-        console.error(error);
+        console.error("Device enumeration error:", error);
       }
     }
 
-    void getAudioDevices();
+    void getDevices();
   }, []);
 
   const handleSave = () => {
@@ -272,123 +367,303 @@ export default function Recorder({ closeModal, step, setStep }: Props) {
   return (
     <div>
       {step === "pre" ? (
-        <div className="w-full">
-          <Listbox value={selectedDevice} onChange={setSelectedDevice}>
-            <div className="relative mt-1">
-              <Listbox.Button className="relative flex w-full cursor-default flex-row items-center justify-start rounded-lg bg-white py-2 pl-3 pr-10 text-left shadow-md focus:outline-none focus-visible:border-indigo-500 focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-opacity-75 focus-visible:ring-offset-2 sm:text-sm">
-                <MicrophoneIcon
-                  className="mr-2 h-5 w-5 text-gray-400"
-                  aria-hidden="true"
-                />
-                <span className="block truncate">
-                  {selectedDevice?.label ?? "No device selected"}
-                  {selectedDevice?.label === "" ? "Enabled" : null}
-                </span>
-                <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
-                  <ChevronUpDownIcon
-                    className="h-5 w-5 text-gray-400"
+        <div className="w-full space-y-4 min-w-[280px] sm:min-w-[340px]">
+          {/* Audio Input Device */}
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-gray-500">
+              Microphone
+            </label>
+            <Listbox
+              value={selectedAudioDevice}
+              onChange={setSelectedAudioDevice}
+            >
+              <div className="relative">
+                <Listbox.Button className="relative flex w-full cursor-default flex-row items-center justify-start rounded-lg bg-white py-2 pl-3 pr-10 text-left shadow-sm border border-gray-200 focus:outline-none focus-visible:border-indigo-500 focus-visible:ring-2 focus-visible:ring-indigo-500 sm:text-sm">
+                  <MicrophoneIcon
+                    className="mr-2 h-5 w-5 text-gray-400"
                     aria-hidden="true"
                   />
-                </span>
-              </Listbox.Button>
-              <Transition
-                as={Fragment}
-                enter="ease-out duration-300"
-                enterFrom="opacity-0"
-                enterTo="opacity-100"
-                leave="ease-in duration-200"
-                leaveFrom="opacity-100"
-                leaveTo="opacity-0"
-              >
-                <Listbox.Options className="absolute mt-1 max-h-60 w-full overflow-auto rounded-md bg-white py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm">
-                  {audioDevices.map((audioDevice, i) => (
-                    <Listbox.Option
-                      key={i}
-                      className={({ active }) =>
-                        `relative cursor-default select-none py-2 pl-10 pr-4 text-gray-900 ${
-                          active ? "bg-gray-200" : ""
-                        }`
-                      }
-                      value={audioDevice}
-                    >
-                      {({ selected }) => (
-                        <>
-                          <span
-                            className={`block truncate ${
-                              selected ? "font-medium" : "font-normal"
-                            }`}
-                          >
-                            {audioDevice.label}
-                          </span>
-                          {selected ? (
-                            <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-amber-600">
-                              <CheckIcon
-                                className="h-5 w-5"
-                                aria-hidden="true"
-                              />
+                  <span className="block truncate">
+                    {selectedAudioDevice?.label || "Default Microphone"}
+                  </span>
+                  <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
+                    <ChevronUpDownIcon
+                      className="h-5 w-5 text-gray-400"
+                      aria-hidden="true"
+                    />
+                  </span>
+                </Listbox.Button>
+                <Transition
+                  as={Fragment}
+                  enter="ease-out duration-300"
+                  enterFrom="opacity-0"
+                  enterTo="opacity-100"
+                  leave="ease-in duration-200"
+                  leaveFrom="opacity-100"
+                  leaveTo="opacity-0"
+                >
+                  <Listbox.Options className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md bg-white py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm">
+                    {audioDevices.map((audioDevice, i) => (
+                      <Listbox.Option
+                        key={audioDevice.deviceId || i}
+                        className={({ active }) =>
+                          `relative cursor-default select-none py-2 pl-10 pr-4 text-gray-900 ${
+                            active ? "bg-gray-100" : ""
+                          }`
+                        }
+                        value={audioDevice}
+                      >
+                        {({ selected }) => (
+                          <>
+                            <span
+                              className={`block truncate ${
+                                selected ? "font-medium" : "font-normal"
+                              }`}
+                            >
+                              {audioDevice.label || `Microphone ${i + 1}`}
                             </span>
-                          ) : null}
-                        </>
-                      )}
-                    </Listbox.Option>
-                  ))}
-                </Listbox.Options>
-              </Transition>
+                            {selected ? (
+                              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-indigo-600">
+                                <CheckIcon
+                                  className="h-5 w-5"
+                                  aria-hidden="true"
+                                />
+                              </span>
+                            ) : null}
+                          </>
+                        )}
+                      </Listbox.Option>
+                    ))}
+                  </Listbox.Options>
+                </Transition>
+              </div>
+            </Listbox>
+          </div>
+
+          {/* Camera Input Device & Toggle */}
+          <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label className="text-xs font-semibold uppercase tracking-wider text-gray-500">
+                Camera Presenter
+              </label>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-500">
+                  {isCameraEnabled ? "On" : "Off"}
+                </span>
+                <Switch
+                  checked={isCameraEnabled}
+                  onChange={setIsCameraEnabled}
+                  className={`${
+                    isCameraEnabled ? "bg-indigo-600" : "bg-gray-200"
+                  } relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none`}
+                >
+                  <span
+                    className={`${
+                      isCameraEnabled ? "translate-x-4" : "translate-x-0"
+                    } pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out`}
+                  />
+                </Switch>
+              </div>
             </div>
-          </Listbox>
+
+            {isCameraEnabled ? (
+              <Listbox
+                value={selectedCameraDevice}
+                onChange={setSelectedCameraDevice}
+              >
+                <div className="relative">
+                  <Listbox.Button className="relative flex w-full cursor-default flex-row items-center justify-start rounded-lg bg-white py-2 pl-3 pr-10 text-left shadow-sm border border-gray-200 focus:outline-none focus-visible:border-indigo-500 focus-visible:ring-2 focus-visible:ring-indigo-500 sm:text-sm">
+                    <VideoCameraIcon
+                      className="mr-2 h-5 w-5 text-gray-400"
+                      aria-hidden="true"
+                    />
+                    <span className="block truncate">
+                      {selectedCameraDevice?.label || "Default Camera"}
+                    </span>
+                    <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
+                      <ChevronUpDownIcon
+                        className="h-5 w-5 text-gray-400"
+                        aria-hidden="true"
+                      />
+                    </span>
+                  </Listbox.Button>
+                  <Transition
+                    as={Fragment}
+                    enter="ease-out duration-300"
+                    enterFrom="opacity-0"
+                    enterTo="opacity-100"
+                    leave="ease-in duration-200"
+                    leaveFrom="opacity-100"
+                    leaveTo="opacity-0"
+                  >
+                    <Listbox.Options className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md bg-white py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm">
+                      {videoDevices.map((device, i) => (
+                        <Listbox.Option
+                          key={device.deviceId || i}
+                          className={({ active }) =>
+                            `relative cursor-default select-none py-2 pl-10 pr-4 text-gray-900 ${
+                              active ? "bg-gray-100" : ""
+                            }`
+                          }
+                          value={device}
+                        >
+                          {({ selected }) => (
+                            <>
+                              <span
+                                className={`block truncate ${
+                                  selected ? "font-medium" : "font-normal"
+                                }`}
+                              >
+                                {device.label || `Camera ${i + 1}`}
+                              </span>
+                              {selected ? (
+                                <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-indigo-600">
+                                  <CheckIcon
+                                    className="h-5 w-5"
+                                    aria-hidden="true"
+                                  />
+                                </span>
+                              ) : null}
+                            </>
+                          )}
+                        </Listbox.Option>
+                      ))}
+                    </Listbox.Options>
+                  </Transition>
+                </div>
+              </Listbox>
+            ) : null}
+          </div>
+
+          {/* Initial Bubble Corner Preference */}
+          {isCameraEnabled ? (
+            <div>
+              <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-gray-500">
+                Bubble Corner
+              </label>
+              <div className="grid grid-cols-4 gap-1.5 text-xs">
+                {(
+                  [
+                    ["bottom-left", "BL"],
+                    ["bottom-right", "BR"],
+                    ["top-left", "TL"],
+                    ["top-right", "TR"],
+                  ] as const
+                ).map(([cornerVal, label]) => (
+                  <button
+                    key={cornerVal}
+                    type="button"
+                    onClick={() => setBubbleCorner(cornerVal)}
+                    className={`rounded border py-1.5 font-medium transition ${
+                      bubbleCorner === cornerVal
+                        ? "border-indigo-600 bg-indigo-50 text-indigo-700"
+                        : "border-gray-200 text-gray-600 hover:border-gray-300"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <button
             type="button"
-            className="mt-4 inline-flex w-full items-center justify-center rounded-md bg-indigo-500 px-4 py-2 text-sm font-semibold leading-6 text-white shadow transition duration-150 ease-in-out hover:bg-indigo-400 disabled:cursor-not-allowed"
+            className="mt-4 inline-flex w-full items-center justify-center rounded-md bg-indigo-600 px-4 py-2.5 text-sm font-semibold leading-6 text-white shadow transition duration-150 ease-in-out hover:bg-indigo-500 disabled:cursor-not-allowed"
             onClick={() => void handleRecording()}
           >
             <span>Start recording</span>
           </button>
         </div>
       ) : null}
+
       {step === "in" ? (
-        <div className="flex flex-row items-center justify-center">
-          <Tooltip title="Finish recording">
-            <div
-              onClick={handleStop}
-              className="flex cursor-pointer flex-row items-center justify-center rounded pr-2 text-lg hover:bg-gray-200"
-            >
-              <StopIcon className="h-8 w-8 text-[#ff623f]" aria-hidden="true" />
-              <StopTime
-                running={!pause}
-                duration={duration}
-                setDuration={setDuration}
-              />
-            </div>
-          </Tooltip>
-          <div className="mx-2 h-6 w-px bg-[#E7E9EB]"></div>
-          <Tooltip title={pause ? "Resume" : "Pause"}>
-            <div
-              onClick={handlePause}
-              className="cursor-pointer rounded p-1 hover:bg-gray-200"
-            >
-              {pause ? (
-                <ResumeIcon
+        <>
+          <div className="flex flex-row items-center justify-center">
+            <Tooltip title="Finish recording">
+              <div
+                onClick={handleStop}
+                className="flex cursor-pointer flex-row items-center justify-center rounded pr-2 text-lg hover:bg-gray-200"
+              >
+                <StopIcon
+                  className="h-8 w-8 text-[#ff623f]"
+                  aria-hidden="true"
+                />
+                <StopTime
+                  running={!pause}
+                  duration={duration}
+                  setDuration={setDuration}
+                />
+              </div>
+            </Tooltip>
+            <div className="mx-2 h-6 w-px bg-[#E7E9EB]"></div>
+            <Tooltip title={pause ? "Resume" : "Pause"}>
+              <div
+                onClick={handlePause}
+                className="cursor-pointer rounded p-1 hover:bg-gray-200"
+              >
+                {pause ? (
+                  <ResumeIcon
+                    className="h-6 w-6 text-gray-400"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <PauseIcon
+                    className="h-6 w-6 text-gray-400"
+                    aria-hidden="true"
+                  />
+                )}
+              </div>
+            </Tooltip>
+            <Tooltip title="Cancel recording">
+              <div
+                onClick={handleDelete}
+                className="ml-1 cursor-pointer rounded p-1 hover:bg-gray-200"
+              >
+                <TrashIcon
                   className="h-6 w-6 text-gray-400"
                   aria-hidden="true"
                 />
-              ) : (
-                <PauseIcon
-                  className="h-6 w-6 text-gray-400"
-                  aria-hidden="true"
-                />
-              )}
-            </div>
-          </Tooltip>
-          <Tooltip title="Cancel recording">
-            <div
-              onClick={handleDelete}
-              className="ml-1 cursor-pointer rounded p-1 hover:bg-gray-200"
-            >
-              <TrashIcon className="h-6 w-6 text-gray-400" aria-hidden="true" />
-            </div>
-          </Tooltip>
-        </div>
+              </div>
+            </Tooltip>
+          </div>
+
+          {/* Floating Live Camera Bubble Overlay during recording */}
+          {cameraStream && isCameraEnabled ? (
+            <CameraBubbleOverlay
+              stream={cameraStream}
+              isMuted={isCameraMuted}
+              isMirrored={isMirrored}
+              bubbleCorner={bubbleCorner}
+              bubbleSize={bubbleSize}
+              onToggleMute={() => {
+                const next = !isCameraMuted;
+                setIsCameraMuted(next);
+                compositorRef.current?.setCameraMuted(next);
+              }}
+              onToggleMirror={() => {
+                const next = !isMirrored;
+                setIsMirrored(next);
+                compositorRef.current?.setMirrored(next);
+              }}
+              onChangeSize={(size) => {
+                setBubbleSize(size);
+                compositorRef.current?.setBubbleSize(size);
+              }}
+              onChangeCorner={(corner) => {
+                setBubbleCorner(corner);
+                setNormalizedPosition(null);
+                compositorRef.current?.setCorner(corner);
+              }}
+              onPositionChange={(pos) => {
+                setNormalizedPosition(pos);
+                compositorRef.current?.setNormalizedPosition(pos);
+              }}
+            />
+          ) : null}
+        </>
       ) : null}
+
       {step === "post" ? (
         <div>
           {blob ? (

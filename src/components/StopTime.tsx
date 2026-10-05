@@ -3,7 +3,7 @@ import React, { useEffect } from "react";
 interface Props {
   running: boolean;
   duration: number;
-  setDuration: React.Dispatch<React.SetStateAction<number>>;
+  setDuration?: React.Dispatch<React.SetStateAction<number>>;
 }
 
 export default function StopTime({ running, duration, setDuration }: Props) {
@@ -30,7 +30,7 @@ export default function StopTime({ running, duration, setDuration }: Props) {
   };
 
   useEffect(() => {
-    if (!running) return;
+    if (!running || !setDuration) return;
     const interval = setInterval(() => setDuration((sec) => sec + 1), 1000);
     return () => clearInterval(interval);
   }, [running, setDuration]);
