@@ -34,6 +34,14 @@ export default defineConfig({
       use: {
         ...devices["Desktop Chrome"],
         storageState: "tests/.auth/user.json",
+        launchOptions: {
+          args: [
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+            "--auto-select-desktop-capture-source=Entire screen",
+            "--disable-gesture-requirement-for-media-playback",
+          ],
+        },
       },
     },
   ],
